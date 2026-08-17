@@ -1,5 +1,7 @@
 # @dsh-external/dsh-session-slim
 
+GitHub: https://github.com/FirsryFan/dsh-session-slim
+
 DSH（DeepSeek Harness）会话内存/性能优化插件。
 
 ## 解决的问题
