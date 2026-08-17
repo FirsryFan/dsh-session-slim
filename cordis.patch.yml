@@ -1,0 +1,4 @@
+# @dsh-external/dsh-session-slim bundle patch.
+- insert:
+    - id: dsh-session-slim
+      name: "@dsh-external/dsh-session-slim"

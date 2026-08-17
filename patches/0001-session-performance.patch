@@ -1,0 +1,1030 @@
+diff --git a/packages/client/runtime/src/client/sessions/session.ts b/packages/client/runtime/src/client/sessions/session.ts
+index 3e5ec5a811..cf0abff866 100644
+--- a/packages/client/runtime/src/client/sessions/session.ts
++++ b/packages/client/runtime/src/client/sessions/session.ts
+@@ -3,6 +3,7 @@
+ import type { Context } from '@deepseek-ai/cordis'
+ import type { AttachmentIdType, ImageAttachmentRef } from '@deepseek-ai/dsh-attachment'
+ import type { SessionEvent } from '@deepseek-ai/dsh-session/types'
++import { isAppendSurfaceEvent } from '@deepseek-ai/dsh-session/surface'
+ import type {
+   HistoryEntry, IApiClient, MessageId, MuxFrame, PromptContentPart, QueueAction, RpcError,
+   RpcId, RpcResponse, RpcResult, SessionId, SubagentAddress, ToolEventView,
+@@ -673,14 +674,41 @@ export class Session implements SessionFace {
+     if (event.type === 'turn/start') this.firstPromptPendingTurn = false
+     const queueChanged = this.queueMirror.acceptDurable(event)
+     const publication = this.conversation.append({ event, view })
++    // A settled step carries a compact stream summary on its final message; the
++    // raw deltas are no longer needed for rendering or trajectory, so drop them
++    // from the browser window to keep long live sessions from accumulating tens
++    // of thousands of per-token event objects.
++    if (event.type === 'assistant/message'
++      && isAppendSurfaceEvent(event)
++      && event.data.stream !== undefined) {
++      this.pruneSettledChunks(event.data.turn, event.data.step)
++    }
+     return queueChanged ? 'immediate' : publication
+   }
+ 
++  /** Remove `assistant/chunk` events for a settled step from the local window. */
++  private pruneSettledChunks(turn: number, step: number): void {
++    const key = `${turn}:${step}`
++    const events: SessionEvent[] = []
++    const views: (ToolEventView | undefined)[] = []
++    for (let index = 0; index < this.events.length; index++) {
++      const event = this.events[index] as SessionEvent
++      if (event.type === 'assistant/chunk' && `${event.data.turn}:${event.data.step}` === key) continue
++      events.push(event)
++      views.push(this.views[index])
++    }
++    if (events.length === this.events.length) return
++    this.events = events
++    this.views = views
++    this.baseSeq = events[0]?.seq ?? 0
++  }
++
+   /** Land a live session/event (open/repair in flight -> buffer; overlapping seq -> drop;
+    *  a seq gap -> buffer + tail-page repull instead of appending a hole (a gap is an
+-   *  expected reconnect-window artifact, repaired by refetch). The window stays one contiguous
+-   *  raw range, which lets Conversation Definitions correlate every recorded event between its
+-   *  ends and lets a compaction checkpoint resolve its cited summary event. */
++   *  expected reconnect-window artifact, repaired by refetch). The window retains one
++   *  contiguous envelope range; per-token `assistant/chunk` events for settled steps are
++   *  pruned once their final message carries a `stream` summary, so retained seqs may have
++   *  gaps where only those deltas used to sit. */
+   private acceptLiveEvent(event: SessionEvent, view?: ToolEventView): void {
+     if (this.openState === 'loading' || this.stitching) {
+       this.liveBuffer.push({ event, view })
+diff --git a/packages/client/runtime/tests/session.client.spec.ts b/packages/client/runtime/tests/session.client.spec.ts
+index 19e80dfd5b..e6a6842b16 100644
+--- a/packages/client/runtime/tests/session.client.spec.ts
++++ b/packages/client/runtime/tests/session.client.spec.ts
+@@ -265,6 +265,33 @@ describe('live event path', () => {
+     expect(session.getSnapshot().nodes).toEqual(before.nodes)
+   })
+ 
++  it('prunes settled assistant chunks from the live window once the final message carries a stream summary', async () => {
++    const { session } = await opened([])
++    const feed = (event: SessionEvent) => {
++      session.handleMuxEnvelope('r' as never, { type: 'session/event', sessionId: SID, event })
++    }
++    const turnStart = ev.turnStart(0, 1)
++    const stepStart = ev.stepStart(1, 1)
++    const chunk1 = ev.chunkText(2, 1, 'a')
++    const chunk2 = ev.chunkText(3, 1, 'b')
++    const assistant = ev.assistant(4, 1, 'ab')
++    ;(assistant as { data: { stream?: unknown } }).data.stream = {
++      firstChunkSeq: chunk1.seq,
++      firstChunkTime: chunk1.time,
++      firstTokenTime: chunk1.time,
++      chunkCount: 2,
++    }
++    feed(turnStart)
++    feed(stepStart)
++    feed(chunk1)
++    feed(chunk2)
++    feed(assistant)
++    await Promise.resolve()
++    const internal = session as unknown as { events: SessionEvent[] }
++    expect(internal.events.some(event => event.type === 'assistant/chunk')).toBe(false)
++    expect(internal.events.some(event => event.type === 'assistant/message')).toBe(true)
++  })
++
+   it('keeps the authoritative host blank bit across unrelated log events', async () => {
+     const { session } = await opened([])
+     session.handleBlank(true)
+diff --git a/packages/client/ui-conversation/src/client/conversation-nodes/assistant.ts b/packages/client/ui-conversation/src/client/conversation-nodes/assistant.ts
+index 880bbafa44..62ed98f97c 100644
+--- a/packages/client/ui-conversation/src/client/conversation-nodes/assistant.ts
++++ b/packages/client/ui-conversation/src/client/conversation-nodes/assistant.ts
+@@ -190,12 +190,19 @@ function fallbackState(context: ConversationNodeContext<AssistantState>): Assist
+     }
+     if (match.event.type === 'assistant/message') {
+       state ??= initialState(match.event.data.turn, match.event.data.step)
++      const stream = match.event.data.stream
+       state = {
+         ...state,
+         blocks: toAssistantBlocks(match.event.data.message.content),
+         hidden: false,
+         final: match,
+         usage: match.event.data.usage,
++        ...state.firstVisibleSeq === undefined && stream !== undefined
++          ? { firstVisibleSeq: stream.firstChunkSeq, firstVisibleTime: stream.firstChunkTime }
++          : {},
++        ...state.firstTokenTime === undefined && stream?.firstTokenTime !== undefined
++          ? { firstTokenTime: stream.firstTokenTime }
++          : {},
+       }
+       continue
+     }
+@@ -262,12 +269,19 @@ export const assistantDefinition: ConversationNodeDefinition<AssistantState> = {
+   update: (context, match) => {
+     if (match.event.type === 'assistant/chunk') return updateChunk(context.state, match)
+     if (match.event.type === 'assistant/message') {
++      const stream = match.event.data.stream
+       return {
+         ...context.state,
+         blocks: toAssistantBlocks(match.event.data.message.content),
+         hidden: false,
+         final: match,
+         usage: match.event.data.usage,
++        ...context.state.firstVisibleSeq === undefined && stream !== undefined
++          ? { firstVisibleSeq: stream.firstChunkSeq, firstVisibleTime: stream.firstChunkTime }
++          : {},
++        ...context.state.firstTokenTime === undefined && stream?.firstTokenTime !== undefined
++          ? { firstTokenTime: stream.firstTokenTime }
++          : {},
+       }
+     }
+     if (match.event.type === 'llm/retry') {
+diff --git a/packages/client/ui-trajectory/src/client/trajectory-assistant-definition.ts b/packages/client/ui-trajectory/src/client/trajectory-assistant-definition.ts
+index 3614d4e0d7..83ffc23b39 100644
+--- a/packages/client/ui-trajectory/src/client/trajectory-assistant-definition.ts
++++ b/packages/client/ui-trajectory/src/client/trajectory-assistant-definition.ts
+@@ -185,11 +185,19 @@ function fallbackState(context: ConversationNodeContext<AssistantState>): Assist
+       state = updateChunk(state, match)
+     } else if (event.type === 'assistant/message') {
+       state ??= initialState(event.data.turn, event.data.step, event.seq, event.time, false)
++      const stream = event.data.stream
+       state = {
+         ...state,
+         blocks: toAssistantBlocks(event.data.message.content),
+         final: match,
+         usage: state.usage ?? event.data.usage,
++        ...state.firstVisibleSeq === undefined && stream !== undefined
++          ? { firstVisibleSeq: stream.firstChunkSeq, firstVisibleTime: stream.firstChunkTime }
++          : {},
++        ...state.firstTokenTime === undefined && stream?.firstTokenTime !== undefined
++          ? { firstTokenTime: stream.firstTokenTime }
++          : {},
++        ...stream !== undefined ? { sawChunk: true } : {},
+       }
+     } else if (event.type === 'step/end' && state !== undefined) {
+       state = { ...state, stepEnd: match }
+@@ -305,11 +313,19 @@ const trajectoryAssistantDefinition: ConversationNodeDefinition<AssistantState>
+   update: (context, match) => {
+     if (match.event.type === 'assistant/chunk') return updateChunk(context.state, match)
+     if (match.event.type === 'assistant/message') {
++      const stream = match.event.data.stream
+       return {
+         ...context.state,
+         blocks: toAssistantBlocks(match.event.data.message.content),
+         final: match,
+         usage: context.state.usage ?? match.event.data.usage,
++        ...context.state.firstVisibleSeq === undefined && stream !== undefined
++          ? { firstVisibleSeq: stream.firstChunkSeq, firstVisibleTime: stream.firstChunkTime }
++          : {},
++        ...context.state.firstTokenTime === undefined && stream?.firstTokenTime !== undefined
++          ? { firstTokenTime: stream.firstTokenTime }
++          : {},
++        ...stream !== undefined ? { sawChunk: true } : {},
+       }
+     }
+     if (match.event.type === 'step/end') return { ...context.state, stepEnd: match }
+diff --git a/packages/core/agent-loop/src/agent.ts b/packages/core/agent-loop/src/agent.ts
+index 668ef65826..b7ec897947 100644
+--- a/packages/core/agent-loop/src/agent.ts
++++ b/packages/core/agent-loop/src/agent.ts
+@@ -23,12 +23,13 @@ import {
+   createAssistantMessage,
+   deepFreeze,
+   errorChain,
++  isTokenDelta,
+   markAgentLoopRequest,
+ } from '@deepseek-ai/dsh-llm'
+ import type { Scope } from '@deepseek-ai/dsh-scope'
+ import { createScope } from '@deepseek-ai/dsh-scope'
+ import type { EpochHeader, RequestContext, Session, SessionId, TurnEndReason, UserMessage } from '@deepseek-ai/dsh-session'
+-import { canonicalHeader, headerEquals } from '@deepseek-ai/dsh-session'
++import { canonicalHeader, headerEquals, sourceSeqCompress } from '@deepseek-ai/dsh-session'
+ import { joinContextSections, renderContextSections, renderPrompt } from '@deepseek-ai/dsh-system-prompt'
+ import type { PromptAssembly } from '@deepseek-ai/dsh-system-prompt'
+ import type { Context } from '@deepseek-ai/cordis'
+@@ -342,11 +343,20 @@ export class ReactLoopAgent implements Agent {
+       )
+       const assembler = new BlockAssembler()
+       const chunkSeqs: number[] = []
++      let firstChunkSeq: number | undefined
++      let firstChunkTime: number | undefined
++      let firstTokenTime: number | undefined
+       const stream = preparedCall?.stream(request) ?? this.loopCtx.llm.stream(request)
+       signal.throwIfAborted()
+       for await (const chunk of stream) {
+         signal.throwIfAborted()
+-        chunkSeqs.push(this.session.append('assistant/chunk', { turn, step, chunk }).seq)
++        const chunkEvent = this.session.append('assistant/chunk', { turn, step, chunk })
++        chunkSeqs.push(chunkEvent.seq)
++        if (firstChunkSeq === undefined) {
++          firstChunkSeq = chunkEvent.seq
++          firstChunkTime = chunkEvent.time
++        }
++        if (firstTokenTime === undefined && isTokenDelta(chunk)) firstTokenTime = chunkEvent.time
+         assembler.push(chunk)
+       }
+       signal.throwIfAborted()
+@@ -385,8 +395,16 @@ export class ReactLoopAgent implements Agent {
+           step,
+           message,
+           ...assembler.usage === undefined ? {} : { usage: assembler.usage },
++          ...firstChunkSeq === undefined ? {} : {
++            stream: {
++              firstChunkSeq,
++              firstChunkTime: firstChunkTime as number,
++              ...firstTokenTime === undefined ? {} : { firstTokenTime },
++              chunkCount: chunkSeqs.length,
++            },
++          },
+         },
+-        { surfaceOp: 'append', sourceEventSeqs: chunkSeqs },
++        { surfaceOp: 'append', sourceEventSeqs: sourceSeqCompress(chunkSeqs) },
+       )
+       if (finish.kind === 'max-tokens') return { kind: 'max-tokens' }
+ 
+diff --git a/packages/core/agent-loop/src/runtime-context.ts b/packages/core/agent-loop/src/runtime-context.ts
+index 63b353ebae..61d5fa97ba 100644
+--- a/packages/core/agent-loop/src/runtime-context.ts
++++ b/packages/core/agent-loop/src/runtime-context.ts
+@@ -6,7 +6,7 @@
+ import { createUserMessage } from '@deepseek-ai/dsh-llm'
+ import type { ContextSnapshotSection } from '@deepseek-ai/dsh-llm'
+ import type { Session, UserMessage } from '@deepseek-ai/dsh-session'
+-import { isReplacementSurfaceEvent } from '@deepseek-ai/dsh-session'
++import { isReplacementSurfaceEvent, sourceSeqIncludes } from '@deepseek-ai/dsh-session'
+ import type { Context } from '@deepseek-ai/cordis'
+ 
+ const SOURCE = '@deepseek-ai/dsh-system-prompt'
+@@ -49,7 +49,7 @@ export class RuntimeContextProjection {
+         this.retained = { seq: event.seq, text: textOf(event.data) }
+       } else if (this.retained
+         && isReplacementSurfaceEvent(event)
+-        && event.sourceEventSeqs?.includes(this.retained.seq) === true) {
++        && sourceSeqIncludes(event.sourceEventSeqs, this.retained.seq) === true) {
+         this.retained = null
+       }
+     })
+diff --git a/packages/core/agent-loop/tests/loop.spec.ts b/packages/core/agent-loop/tests/loop.spec.ts
+index ca4a5309c9..66ed846972 100644
+--- a/packages/core/agent-loop/tests/loop.spec.ts
++++ b/packages/core/agent-loop/tests/loop.spec.ts
+@@ -1,7 +1,7 @@
+ import { describe, expect, it } from 'vitest'
+ import { Context } from '@deepseek-ai/cordis'
+ import LlmRuntime, { createUserMessage, CallId, LlmError, StreamChunk  } from '@deepseek-ai/dsh-llm'
+-import SessionStore, { SessionId, TurnEndReason } from '@deepseek-ai/dsh-session'
++import SessionStore, { SessionId, TurnEndReason, sourceSeqExpand } from '@deepseek-ai/dsh-session'
+ import SystemPrompt from '@deepseek-ai/dsh-system-prompt'
+ import ToolRuntime, { defineContentToolFixture } from '@deepseek-ai/dsh-tools'
+ import AgentRegistry, { type Agent } from '@deepseek-ai/dsh-agent'
+@@ -1101,6 +1101,12 @@ describe('agent loop', () => {
+         source: { kind: 'model', provider: 'mock', model: 'mock' },
+       },
+       usage: { inputTokens: 10, outputTokens: 5 },
++      stream: expect.objectContaining({
++        firstChunkSeq: expect.any(Number) as number,
++        firstChunkTime: expect.any(Number) as number,
++        firstTokenTime: expect.any(Number) as number,
++        chunkCount: expect.any(Number) as number,
++      }),
+     })
+   })
+ 
+@@ -1140,8 +1146,14 @@ describe('agent loop', () => {
+         content: [],
+         source: { kind: 'model', provider: 'mock', model: 'mock' },
+       },
++      stream: expect.objectContaining({
++        firstChunkSeq: expect.any(Number) as number,
++        firstChunkTime: expect.any(Number) as number,
++        firstTokenTime: expect.any(Number) as number,
++        chunkCount: expect.any(Number) as number,
++      }),
+     })
+-    expect(assistant.sourceEventSeqs?.length).toBeGreaterThan(0)
++    expect(sourceSeqExpand(assistant.sourceEventSeqs ?? []).length).toBeGreaterThan(0)
+     expect(agent.session.deriveMessages()).toEqual([{
+       id: expect.any(String) as unknown,
+       role: 'user',
+@@ -1174,8 +1186,13 @@ describe('agent loop', () => {
+         content: [],
+         source: { kind: 'model', provider: 'mock', model: 'mock' },
+       },
++      stream: expect.objectContaining({
++        firstChunkSeq: expect.any(Number) as number,
++        firstChunkTime: expect.any(Number) as number,
++        chunkCount: expect.any(Number) as number,
++      }),
+     })
+-    expect(assistant.sourceEventSeqs?.length).toBe(1)
++    expect(sourceSeqExpand(assistant.sourceEventSeqs ?? []).length).toBe(1)
+     expect(agent.session.deriveMessages()).toEqual([{
+       id: expect.any(String) as unknown,
+       role: 'user',
+diff --git a/packages/core/session/src/index.ts b/packages/core/session/src/index.ts
+index 2d82a88623..f8404dcc9b 100644
+--- a/packages/core/session/src/index.ts
++++ b/packages/core/session/src/index.ts
+@@ -29,6 +29,14 @@ export type { JsonValue } from './json.ts'
+ export { interruptedTurnClosers, TOOL_NOT_STARTED, TOOL_OUTCOME_UNKNOWN } from './repair.ts'
+ export { decodeStorageRecord, packChunkRuns } from './chunk-rows.ts'
+ export type { ChunkRow, StorageRecord } from './chunk-rows.ts'
++export {
++  isSourceSeqRange,
++  sourceSeqCompress,
++  sourceSeqExpand,
++  sourceSeqIncludes,
++  sourceSeqMin,
++} from './source-seq.ts'
++export type { SourceEventSeqs, SourceSeqRange } from './source-seq.ts'
+ export type { SessionSurface, SurfaceFoldReplacement, SurfaceFoldResult } from './surface.ts'
+ export { deriveEventMessage, foldSurface, isAppendSurfaceEvent, isReplacementSurfaceEvent, isSurfaceEvent, isSurfaceEligibleType } from './surface.ts'
+ export { canonicalHeader, foldRequestHeader, headerEquals } from './request-header.ts'
+diff --git a/packages/core/session/src/source-seq.ts b/packages/core/session/src/source-seq.ts
+new file mode 100644
+index 0000000000..b5d30bc465
+--- /dev/null
++++ b/packages/core/session/src/source-seq.ts
+@@ -0,0 +1,69 @@
++/**
++ * Compact representation for `sourceEventSeqs`.
++ *
++ * Most large provenance sets are the consecutive seqs of an assistant stream
++ * (e.g. chunk seq 16..48718). Storing those as a plain number array is the
++ * dominant session-log bloat for long reasoning/tool outputs. This module
++ * provides a range form and helpers that accept both the legacy array form and
++ * the compact range form, so old logs and small non-consecutive sets keep
++ * working unchanged.
++ *
++ * @module @deepseek-ai/dsh-session/source-seq
++ */
++
++/**
++ * A dense inclusive range of earlier event seqs.
++ * `start` and `end` are both non-negative safe integers with `start <= end`.
++ */
++export interface SourceSeqRange {
++  readonly start: number
++  readonly end: number
++}
++
++/** Accepted wire/storage shape for `sourceEventSeqs`. */
++export type SourceEventSeqs = number[] | SourceSeqRange
++
++export function isSourceSeqRange(value: unknown): value is SourceSeqRange {
++  return typeof value === 'object'
++    && value !== null
++    && !Array.isArray(value)
++    && typeof (value as SourceSeqRange).start === 'number'
++    && typeof (value as SourceSeqRange).end === 'number'
++}
++
++/** Smallest cited source seq. */
++export function sourceSeqMin(value: SourceEventSeqs): number {
++  if (isSourceSeqRange(value)) return value.start
++  return value.length === 0 ? -1 : value[0] as number
++}
++
++/** Whether a specific earlier seq is cited. */
++export function sourceSeqIncludes(value: SourceEventSeqs | undefined, seq: number): boolean {
++  if (value === undefined) return false
++  if (isSourceSeqRange(value)) return seq >= value.start && seq <= value.end
++  return value.includes(seq)
++}
++
++/** Expand a compact range back to a plain array (mainly for legacy consumers). */
++export function sourceSeqExpand(value: SourceEventSeqs): number[] {
++  if (!isSourceSeqRange(value)) return [...value]
++  const out: number[] = []
++  for (let seq = value.start; seq <= value.end; seq++) out.push(seq)
++  return out
++}
++
++/**
++ * Compress a plain array into a range when it is non-empty, strictly
++ * consecutive, and large enough to be worth it; otherwise return the array
++ * unchanged. Small or sparse sets stay arrays so consumers that rely on the
++ * array shape keep working.
++ */
++export function sourceSeqCompress(seqs: readonly number[]): SourceEventSeqs {
++  if (seqs.length < 3) return [...seqs]
++  const start = seqs[0] as number
++  const end = seqs[seqs.length - 1] as number
++  for (let index = 1; index < seqs.length; index++) {
++    if ((seqs[index] as number) !== start + index) return [...seqs]
++  }
++  return { start, end }
++}
+diff --git a/packages/core/session/src/surface.ts b/packages/core/session/src/surface.ts
+index ba6c2dda80..b350dbdd6e 100644
+--- a/packages/core/session/src/surface.ts
++++ b/packages/core/session/src/surface.ts
+@@ -10,6 +10,7 @@
+ 
+ import type { Message } from '@deepseek-ai/dsh-llm'
+ import type { SessionEvent, SurfaceEvent, SurfaceEventType, SurfaceOp } from './types.ts'
++import { isSourceSeqRange, type SourceSeqRange } from './source-seq.ts'
+ 
+ /** Runtime counterpart of the message-producing event union. */
+ const SURFACE_EVENT_TYPES = new Set<string>([
+@@ -214,29 +215,42 @@ function assertProvenance(
+ ): void {
+   const raw = (event as SessionEvent & { sourceEventSeqs?: unknown }).sourceEventSeqs
+   const sources = new Set<number>()
++  let range: SourceSeqRange | undefined
+   if (raw !== undefined) {
+-    if (!Array.isArray(raw)) {
+-      throw new Error(`sourceEventSeqs on event at seq ${event.seq} must be an array when present`)
+-    }
+-    if (raw.length === 0 && event.type !== 'assistant/message') {
+-      throw new Error('sourceEventSeqs must not be empty except on assistant/message')
+-    }
+-    let nonEarlierSource: number | undefined
+-    for (const source of raw) {
+-      if (!isEventSeq(source)) {
+-        throw new Error(`session event "${event.type}" sourceEventSeqs must densely contain non-negative safe integers`)
++    if (isSourceSeqRange(raw)) {
++      if (!isEventSeq(raw.start) || !isEventSeq(raw.end) || raw.start > raw.end) {
++        throw new Error(`session event "${event.type}" sourceEventSeqs range must be {start,end} with start <= end`)
++      }
++      if (raw.end >= event.seq) {
++        throw new Error(`sourceEventSeqs range must reference earlier events: end ${raw.end} >= current seq ${event.seq}`)
++      }
++      range = raw
++    } else {
++      if (!Array.isArray(raw)) {
++        throw new Error(`sourceEventSeqs on event at seq ${event.seq} must be an array or {start,end} range when present`)
++      }
++      if (raw.length === 0 && event.type !== 'assistant/message') {
++        throw new Error('sourceEventSeqs must not be empty except on assistant/message')
++      }
++      let nonEarlierSource: number | undefined
++      for (const source of raw) {
++        if (!isEventSeq(source)) {
++          throw new Error(`session event "${event.type}" sourceEventSeqs must densely contain non-negative safe integers`)
++        }
++        sources.add(source)
++        if (nonEarlierSource === undefined && source >= event.seq) nonEarlierSource = source
++      }
++      if (sources.size !== raw.length) {
++        throw new Error('sourceEventSeqs must not contain duplicates')
++      }
++      if (nonEarlierSource !== undefined) {
++        throw new Error(`sourceEventSeqs must reference earlier events: ${nonEarlierSource} >= current seq ${event.seq}`)
+       }
+-      sources.add(source)
+-      if (nonEarlierSource === undefined && source >= event.seq) nonEarlierSource = source
+-    }
+-    if (sources.size !== raw.length) {
+-      throw new Error('sourceEventSeqs must not contain duplicates')
+-    }
+-    if (nonEarlierSource !== undefined) {
+-      throw new Error(`sourceEventSeqs must reference earlier events: ${nonEarlierSource} >= current seq ${event.seq}`)
+     }
+   }
+-  const missing = shadowedSeqs.filter(seq => !sources.has(seq))
++  const missing = range === undefined
++    ? shadowedSeqs.filter(seq => !sources.has(seq))
++    : shadowedSeqs.filter(seq => seq < range.start || seq > range.end)
+   if (missing.length > 0) {
+     throw new Error(`surface replace: sourceEventSeqs must include every shadowed surface node; missing ${missing.join(', ')}`)
+   }
+diff --git a/packages/core/session/src/types.ts b/packages/core/session/src/types.ts
+index 17aacd1dfc..a6e702b220 100644
+--- a/packages/core/session/src/types.ts
++++ b/packages/core/session/src/types.ts
+@@ -1,4 +1,5 @@
+ import type { Branded } from '@deepseek-ai/dsh-brand'
++import type { SourceEventSeqs } from './source-seq.ts'
+ import type {
+   AssistantMessage,
+   CallId,
+@@ -227,6 +228,23 @@ export interface RequestContext {
+  */
+ export type RequestHeaderReason = 'initial' | 'resume' | 'change'
+ 
++/**
++ * Compact timing summary attached to an assembled `assistant/message`.
++ * Optional for backward compatibility: older logs and non-agent appends do not
++ * carry it. It exists so settled steps can be pruned from browser history
++ * without losing TTFT/throughput/first-chunk placement.
++ */
++export interface AssistantStreamSummary {
++  /** Seq of the first `assistant/chunk` that contributed to this message. */
++  firstChunkSeq: number
++  /** Wall-clock ms of the first contributing `assistant/chunk`. */
++  firstChunkTime: number
++  /** Wall-clock ms of the first token-bearing delta, when the stream had one. */
++  firstTokenTime?: number
++  /** Number of `assistant/chunk` events that contributed to this message. */
++  chunkCount: number
++}
++
+ /**
+  * The merge-extensible, append-only source of truth for an agent interaction.
+  * Message history is derived from this log. Every event is lossless JSON and
+@@ -269,8 +287,19 @@ export interface SessionEventMap {
+    * Carries the step's `usage` when the adapter reported token accounting, so
+    * the model output and its accounting travel together (there is no separate
+    * usage record). `usage` is absent when the adapter reported none.
++   *
++   * `stream` is an optional compact timing summary. It lets history readers
++   * keep TTFT/throughput and first-chunk placement even when the raw
++   * `assistant/chunk` events for a settled step are pruned from the browser
++   * history payload.
+    */
+-  'assistant/message': { turn: number; step: number; message: AssistantMessage; usage?: TokenUsage }
++  'assistant/message': {
++    turn: number
++    step: number
++    message: AssistantMessage
++    usage?: TokenUsage
++    stream?: AssistantStreamSummary
++  }
+   /**
+    * The model requested one tool invocation: `name` with the raw `arguments`
+    * JSON string exactly as the model produced it (unparsed). `callId` pairs the
+@@ -384,8 +413,9 @@ export interface SurfaceIntent {
+    * present empty array for a known empty provider stream; when the field is
+    * absent, the event does not record which earlier events produced the message.
+    * Other surface events require a non-empty set when this field is present.
++   * Large dense sets may be stored as a `SourceSeqRange` instead of an array.
+    */
+-  sourceEventSeqs?: number[]
++  sourceEventSeqs?: SourceEventSeqs
+ }
+ 
+ /**
+@@ -427,9 +457,9 @@ export type SessionEvent<T extends SessionEventType = SessionEventType> = {
+      * or the surface nodes shadowed by a compaction replace node). An
+      * `assistant/message` may carry a present empty array for a known empty
+      * provider stream; when the field is absent, the event does not record which
+-     * earlier events produced the message.
++     * earlier events produced the message. Dense sets may use `SourceSeqRange`.
+      */
+-    sourceEventSeqs?: number[]
++    sourceEventSeqs?: SourceEventSeqs
+     /** How this event entered the surface; absent for non-surface events. */
+     surfaceOp?: SurfaceOp
+   } : object)
+diff --git a/packages/core/session/tests/source-seq.spec.ts b/packages/core/session/tests/source-seq.spec.ts
+new file mode 100644
+index 0000000000..54a6cba800
+--- /dev/null
++++ b/packages/core/session/tests/source-seq.spec.ts
+@@ -0,0 +1,38 @@
++import { describe, expect, it } from 'vitest'
++import {
++  isSourceSeqRange,
++  sourceSeqCompress,
++  sourceSeqExpand,
++  sourceSeqIncludes,
++  sourceSeqMin,
++} from '@deepseek-ai/dsh-session'
++
++describe('sourceSeq helpers', () => {
++  it('compresses consecutive arrays of at least three entries into a range', () => {
++    const compressed = sourceSeqCompress([16, 17, 18, 19, 20])
++    expect(isSourceSeqRange(compressed)).toBe(true)
++    if (!isSourceSeqRange(compressed)) throw new Error('unreachable')
++    expect(compressed).toEqual({ start: 16, end: 20 })
++    expect(sourceSeqMin(compressed)).toBe(16)
++    expect(sourceSeqExpand(compressed)).toEqual([16, 17, 18, 19, 20])
++    expect(sourceSeqIncludes(compressed, 18)).toBe(true)
++    expect(sourceSeqIncludes(compressed, 15)).toBe(false)
++    expect(sourceSeqIncludes(compressed, 21)).toBe(false)
++  })
++
++  it('keeps small arrays and non-consecutive arrays as arrays', () => {
++    expect(sourceSeqCompress([1, 2])).toEqual([1, 2])
++    expect(sourceSeqCompress([1, 3, 5])).toEqual([1, 3, 5])
++    expect(isSourceSeqRange(sourceSeqCompress([]))).toBe(false)
++  })
++
++  it('expands an empty array to an empty array and min returns -1', () => {
++    expect(sourceSeqExpand([])).toEqual([])
++    expect(sourceSeqMin([])).toBe(-1)
++  })
++
++  it('round-trips legacy arrays through expand unchanged', () => {
++    const sources = [4, 9, 12]
++    expect(sourceSeqExpand(sources)).toEqual(sources)
++  })
++})
+diff --git a/packages/extensions/tool-cordis/src/api-catalog.ts b/packages/extensions/tool-cordis/src/api-catalog.ts
+index 5a812806da..b4c87037bf 100644
+--- a/packages/extensions/tool-cordis/src/api-catalog.ts
++++ b/packages/extensions/tool-cordis/src/api-catalog.ts
+@@ -3727,11 +3727,11 @@ export const TYPE_API: readonly TypeApiEntry[] = [
+   },
+   {
+     name: 'SessionEvent',
+-    declaration: 'export type SessionEvent<T extends SessionEventType = SessionEventType> = {\n    [K in SessionEventType]: {\n        type: K;\n        seq: number;\n        time: number;\n        data: SessionEventMap[K];\n        ignorable?: true;\n    } & (K extends SurfaceEventType ? {\n        sourceEventSeqs?: number[];\n        surfaceOp?: SurfaceOp;\n    } : object);\n}[T];',
++    declaration: 'export type SessionEvent<T extends SessionEventType = SessionEventType> = {\n    [K in SessionEventType]: {\n        type: K;\n        seq: number;\n        time: number;\n        data: SessionEventMap[K];\n        ignorable?: true;\n    } & (K extends SurfaceEventType ? {\n        sourceEventSeqs?: number[] | { start: number; end: number };\n        surfaceOp?: SurfaceOp;\n    } : object);\n}[T];',
+   },
+   {
+     name: 'SessionEventMap',
+-    declaration: 'export interface SessionEventMap {\n    \'turn/start\': {\n        turn: number;\n    };\n    \'turn/end\': {\n        turn: number;\n        reason: TurnEndReason;\n    };\n    \'step/start\': {\n        turn: number;\n        step: number;\n    };\n    \'step/end\': {\n        turn: number;\n        step: number;\n    };\n    \'user/message\': UserMessage;\n    \'assistant/chunk\': {\n        turn: number;\n        step: number;\n        chunk: StreamChunk;\n    };\n    \'assistant/message\': {\n        turn: number;\n        step: number;\n        message: AssistantMessage;\n        usage?: TokenUsage;\n    };\n    \'tool/call\': {\n        turn: number;\n        step: number;\n        callId: CallId;\n        name: string;\n        arguments: string;\n    };\n    \'tool/result\': {\n        turn: number;\n        step: number;\n        message: ToolResultMessage;\n        error?: {\n            name: string;\n            code: string;\n        };\n        meta?: JsonValue;\n    };\n    \'todo/write\': {\n        todos: TodoItem[];\n    };\n    \'request/header\': {\n        header: EpochHeader;\n        reason: RequestHeaderReason;\n    };\n    \'request/context\': RequestContext;\n    \'session/end-seed\': Record<string, never>;\n}',
++    declaration: 'export interface SessionEventMap {\n    \'turn/start\': {\n        turn: number;\n    };\n    \'turn/end\': {\n        turn: number;\n        reason: TurnEndReason;\n    };\n    \'step/start\': {\n        turn: number;\n        step: number;\n    };\n    \'step/end\': {\n        turn: number;\n        step: number;\n    };\n    \'user/message\': UserMessage;\n    \'assistant/chunk\': {\n        turn: number;\n        step: number;\n        chunk: StreamChunk;\n    };\n    \'assistant/message\': {\n        turn: number;\n        step: number;\n        message: AssistantMessage;\n        usage?: TokenUsage;\n        stream?: AssistantStreamSummary;\n    };\n    \'tool/call\': {\n        turn: number;\n        step: number;\n        callId: CallId;\n        name: string;\n        arguments: string;\n    };\n    \'tool/result\': {\n        turn: number;\n        step: number;\n        message: ToolResultMessage;\n        error?: {\n            name: string;\n            code: string;\n        };\n        meta?: JsonValue;\n    };\n    \'todo/write\': {\n        todos: TodoItem[];\n    };\n    \'request/header\': {\n        header: EpochHeader;\n        reason: RequestHeaderReason;\n    };\n    \'request/context\': RequestContext;\n    \'session/end-seed\': Record<string, never>;\n}',
+   },
+   {
+     name: 'SessionEventMetadataFilter',
+diff --git a/packages/host/apiproxy/src/api-proxy.ts b/packages/host/apiproxy/src/api-proxy.ts
+index bda99362b6..7f52ccadcd 100644
+--- a/packages/host/apiproxy/src/api-proxy.ts
++++ b/packages/host/apiproxy/src/api-proxy.ts
+@@ -12,11 +12,11 @@ import type { Agent, ModelSelection, ModelSelectionRef, AgentOptions, AgentStatu
+ import type {} from '@deepseek-ai/dsh-agent-presets/types'
+ import { AttachmentError } from '@deepseek-ai/dsh-attachment'
+ import type { ImageAttachmentRef } from '@deepseek-ai/dsh-attachment'
+-import { contentHasImage, createUserMessage, freezeMessage, ReasoningEffortId } from '@deepseek-ai/dsh-llm'
++import { contentHasImage, createUserMessage, freezeMessage, isTokenDelta, ReasoningEffortId } from '@deepseek-ai/dsh-llm'
+ import { errorChain } from '@deepseek-ai/dsh-llm'
+ import type { ContentBlock, MessageSource } from '@deepseek-ai/dsh-llm'
+-import { isAppendSurfaceEvent, isJsonValue } from '@deepseek-ai/dsh-session'
+-import type { JsonValue, Session, SessionEvent, SessionEventMap, SessionHeader, SessionId, UserMessage } from '@deepseek-ai/dsh-session'
++import { isAppendSurfaceEvent, isJsonValue, sourceSeqMin } from '@deepseek-ai/dsh-session'
++import type { AssistantStreamSummary, JsonValue, Session, SessionEvent, SessionEventMap, SessionHeader, SessionId, SourceEventSeqs, UserMessage } from '@deepseek-ai/dsh-session'
+ import type { SessionPersistence } from '@deepseek-ai/dsh-session-persistence'
+ import { SessionQueryError, type SessionSearchCursor } from '@deepseek-ai/dsh-session-query'
+ import { SubagentError } from '@deepseek-ai/dsh-subagent'
+@@ -301,8 +301,16 @@ function paginate(
+     const event = window[i] as SessionEvent
+     if (!MESSAGE_TYPES.has(event.type) || !isAppendSurfaceEvent(event)) continue
+     count++
+-    const sources = (event as { sourceEventSeqs?: number[] }).sourceEventSeqs
+-    const groupStart = sources !== undefined && sources.length > 0 ? Math.min(event.seq, ...sources) : event.seq
++    const sources = (event as { sourceEventSeqs?: unknown }).sourceEventSeqs
++    let groupStart = event.seq
++    if (sources !== undefined) {
++      // Handle both legacy arrays and the compact range form without spreading
++      // large provenance sets into Math.min (a long stream can produce tens of
++      // thousands of source seqs, which is both slow and can exceed the
++      // argument-count limit).
++      const min = sourceSeqMin(sources as never)
++      if (min >= 0) groupStart = min
++    }
+     if (count >= maxMessages) {
+       cut = groupStart
+       break
+@@ -801,6 +809,78 @@ function backscanArgs(events: readonly SessionEvent[], callId: string): { name:
+   return undefined
+ }
+ 
++/**
++ * Remove the `sourceEventSeqs` provenance array before an event crosses to the
++ * browser. The web client does not read this field; it only accounts for a large
++ * fraction of history/live payload size on long streams (a single
++ * `assistant/message` can carry tens of thousands of consecutive seq numbers).
++ * `surfaceOp` is deliberately kept: the client uses it to distinguish append
++ * surface events from replacement copies.
++ */
++function withoutSourceEventSeqs(event: SessionEvent): SessionEvent {
++  if (!Object.prototype.hasOwnProperty.call(event, 'sourceEventSeqs')) return event
++  const copy = { ...event } as SessionEvent & { sourceEventSeqs?: SourceEventSeqs }
++  delete copy.sourceEventSeqs
++  return copy
++}
++
++/**
++ * Derive compact stream summaries for every settled assistant step in a history
++ * page. New logs already carry `stream` on `assistant/message`; older logs do
++ * not, so the summary is reconstructed from the page's raw chunk events. The
++ * result is used both to prune those chunks from the wire and to preserve
++ * trajectory timing on the client.
++ */
++function assistantStreamSummaries(
++  events: readonly SessionEvent[],
++): Map<string, AssistantStreamSummary> {
++  const chunkStats = new Map<string, {
++    firstChunkSeq: number
++    firstChunkTime: number
++    firstTokenTime?: number
++    chunkCount: number
++  }>()
++  for (const event of events) {
++    if (event.type !== 'assistant/chunk') continue
++    const { turn, step, chunk } = event.data
++    const key = `${turn}:${step}`
++    const stats = chunkStats.get(key) ?? {
++      firstChunkSeq: event.seq,
++      firstChunkTime: event.time,
++      chunkCount: 0,
++    }
++    if (stats.firstTokenTime === undefined && isTokenDelta(chunk)) stats.firstTokenTime = event.time
++    stats.chunkCount += 1
++    chunkStats.set(key, stats)
++  }
++  const summaries = new Map<string, AssistantStreamSummary>()
++  for (const event of events) {
++    if (event.type !== 'assistant/message' || !isAppendSurfaceEvent(event)) continue
++    const key = `${event.data.turn}:${event.data.step}`
++    const summary = event.data.stream ?? chunkStats.get(key)
++    if (summary !== undefined) summaries.set(key, summary)
++  }
++  return summaries
++}
++
++/**
++ * Drop raw `assistant/chunk` events for steps that already have a final
++ * `assistant/message` plus a compact stream summary. The final message contains
++ * the complete rendered content, so the chat UI does not need the per-token
++ * deltas again; the summary preserves TTFT/throughput for trajectory.
++ */
++function pruneSettledAssistantChunks(
++  events: readonly SessionEvent[],
++  summaries: ReadonlyMap<string, AssistantStreamSummary>,
++): SessionEvent[] {
++  if (summaries.size === 0) return [...events]
++  return events.filter((event) => {
++    if (event.type !== 'assistant/chunk') return true
++    const { turn, step } = event.data
++    return !summaries.has(`${turn}:${step}`)
++  })
++}
++
+ /** Render one detached history page through the same presenter path as ordinary history. */
+ function historyPage(
+   ctx: Context,
+@@ -810,10 +890,24 @@ function historyPage(
+   scope?: ScopeKey,
+ ): { events: HistoryEntry[]; hasMore: boolean } {
+   const page = paginate(events, beforeSeq, maxMessages ?? DEFAULT_MAX_MESSAGES)
++  const summaries = assistantStreamSummaries(page.events)
++  const pageEvents = pruneSettledAssistantChunks(page.events, summaries)
+   return {
+-    events: page.events.map((event) => {
+-      const view = viewFor(ctx, event, callId => backscanArgs(page.events, callId), scope)
+-      return { event, ...view === undefined ? {} : { view } }
++    events: pageEvents.map((event) => {
++      const view = viewFor(ctx, event, callId => backscanArgs(pageEvents, callId), scope)
++      let wireEvent = withoutSourceEventSeqs(event)
++      if (event.type === 'assistant/message'
++        && isAppendSurfaceEvent(event)
++        && event.data.stream === undefined) {
++        const summary = summaries.get(`${event.data.turn}:${event.data.step}`)
++        if (summary !== undefined) {
++          wireEvent = {
++            ...wireEvent,
++            data: { ...wireEvent.data, stream: summary },
++          } as SessionEvent
++        }
++      }
++      return { event: wireEvent, ...view === undefined ? {} : { view } }
+     }),
+     hasMore: page.hasMore,
+   }
+@@ -3490,7 +3584,7 @@ export function createApiProxy(ctx: Context, defaults: ApiProxyDefaults): ApiPro
+               callId => openCalls.get(session.id)?.get(callId) ?? backscanArgs(session.events, callId),
+               ctx.agents.get(session.id),
+             )
+-            queue.push(frame({ type: 'session/event', sessionId: session.id, event, ...view === undefined ? {} : { view } }))
++            queue.push(frame({ type: 'session/event', sessionId: session.id, event: withoutSourceEventSeqs(event), ...view === undefined ? {} : { view } }))
+           }),
+           ctx.on('session/created', (session: Session) => {
+             subscribeSession(queue, session)
+diff --git a/packages/host/apiproxy/src/api/sessions.schema.ts b/packages/host/apiproxy/src/api/sessions.schema.ts
+index 0fbe06bf11..36aef64286 100644
+--- a/packages/host/apiproxy/src/api/sessions.schema.ts
++++ b/packages/host/apiproxy/src/api/sessions.schema.ts
+@@ -43,7 +43,10 @@ export const sessionEventSchema = z.object({
+   seq: z.number().int().nonnegative(),
+   time: z.number(),
+   data: z.unknown(),
+-  sourceEventSeqs: z.array(z.number()).optional(),
++  sourceEventSeqs: z.union([
++    z.array(z.number()),
++    z.object({ start: z.number(), end: z.number() }),
++  ]).optional(),
+   surfaceOp: z.unknown().optional(),
+   ignorable: z.literal(true).optional(),
+ }) as unknown as z.ZodType<SessionEvent>
+diff --git a/packages/host/apiproxy/tests/api-proxy-view.spec.ts b/packages/host/apiproxy/tests/api-proxy-view.spec.ts
+index 3d756b7da8..785747fb75 100644
+--- a/packages/host/apiproxy/tests/api-proxy-view.spec.ts
++++ b/packages/host/apiproxy/tests/api-proxy-view.spec.ts
+@@ -168,6 +168,40 @@ describe('mux live view computation', () => {
+     expect(byCall.get('tool/result:c-gen')?.view).toEqual({ for: 'result', view: { card: 'generic', title: 'gen done' } })
+   })
+ 
++  it('mux live frames strip sourceEventSeqs while preserving surfaceOp', async () => {
++    const { ctx } = await harness()
++    const api = createApiProxy(ctx, { defaultModelSelection: () => ({ provider: 'p', model: 'm' }), cwd: '/tmp' })
++    const abort = new AbortController()
++    const stream = api.events.mux({ rpcId: RpcId('t-mux-strip'), payload: {} }, abort.signal)
++    const collected = collect(stream, 1, abort)
++
++    const session = ctx.sessions.create()
++    session.append('turn/start', { turn: 1 })
++    const chunk1 = session.append('assistant/chunk', {
++      turn: 1, step: 1,
++      chunk: { type: 'text-delta', index: 0, text: 'a' },
++    })
++    const chunk2 = session.append('assistant/chunk', {
++      turn: 1, step: 1,
++      chunk: { type: 'text-delta', index: 0, text: 'b' },
++    })
++    const assistant = session.append('assistant/message', {
++      turn: 1, step: 1,
++      message: createMessage({
++        role: 'assistant',
++        content: [{ type: 'text', text: 'ab' }],
++        source: { kind: 'model', provider: 'p', model: 'm' },
++      }),
++    }, { surfaceOp: 'append', sourceEventSeqs: [chunk1.seq, chunk2.seq] })
++
++    const frames = await collected
++    const frame = frames.find(f => f.type === 'session/event' && f.event.seq === assistant.seq)
++    expect(frame?.type).toBe('session/event')
++    if (frame?.type !== 'session/event') throw new Error('unreachable')
++    expect(Object.prototype.hasOwnProperty.call(frame.event, 'sourceEventSeqs')).toBe(false)
++    expect(frame.event).toMatchObject({ surfaceOp: 'append' })
++  })
++
+   it('serves history entries with call/result views, backscan pairing, and soft-falls', async () => {
+     const { ctx } = await harness()
+     const api = createApiProxy(ctx, { defaultModelSelection: () => ({ provider: 'p', model: 'm' }), cwd: '/tmp' })
+@@ -236,6 +270,88 @@ describe('mux live view computation', () => {
+     expect('view' in (byKey.get('tool/result:h-plain') ?? {})).toBe(false)
+   })
+ 
++  it('history strips sourceEventSeqs from wire events while preserving surfaceOp', async () => {
++    const { ctx } = await harness()
++    const api = createApiProxy(ctx, { defaultModelSelection: () => ({ provider: 'p', model: 'm' }), cwd: '/tmp' })
++    const session = ctx.sessions.create()
++    ctx.agents.register({ id: session.id, session, status: 'idle', ctx } as Agent)
++    session.append('turn/start', { turn: 1 })
++    const chunk1 = session.append('assistant/chunk', {
++      turn: 1, step: 1,
++      chunk: { type: 'text-delta', index: 0, text: 'a' },
++    })
++    const chunk2 = session.append('assistant/chunk', {
++      turn: 1, step: 1,
++      chunk: { type: 'text-delta', index: 0, text: 'b' },
++    })
++    const assistant = session.append('assistant/message', {
++      turn: 1, step: 1,
++      message: createMessage({
++        role: 'assistant',
++        content: [{ type: 'text', text: 'ab' }],
++        source: { kind: 'model', provider: 'p', model: 'm' },
++      }),
++      stream: {
++        firstChunkSeq: chunk1.seq,
++        firstChunkTime: chunk1.time,
++        firstTokenTime: chunk1.time,
++        chunkCount: 2,
++      },
++    }, { surfaceOp: 'append', sourceEventSeqs: [chunk1.seq, chunk2.seq] })
++
++    const response = await api.sessions.history({ rpcId: RpcId('t-hist-strip'), payload: { sessionId: session.id } })
++    expect(response.result.ok).toBe(true)
++    if (!response.result.ok) throw new Error('unreachable')
++    const events = response.result.value.events.map(entry => entry.event)
++    expect(events.some(event => Object.prototype.hasOwnProperty.call(event, 'sourceEventSeqs'))).toBe(false)
++    // Settled steps with a stream summary are pruned: the final message carries
++    // the content and timing, so raw deltas do not need to cross the wire.
++    expect(events.some(event => event.type === 'assistant/chunk')).toBe(false)
++    const wireAssistant = events.find(event => event.seq === assistant.seq)
++    expect(wireAssistant?.type).toBe('assistant/message')
++    expect(wireAssistant).toMatchObject({ surfaceOp: 'append' })
++  })
++
++  it('derives stream summaries for legacy assistant messages and prunes their chunks', async () => {
++    const { ctx } = await harness()
++    const api = createApiProxy(ctx, { defaultModelSelection: () => ({ provider: 'p', model: 'm' }), cwd: '/tmp' })
++    const session = ctx.sessions.create()
++    ctx.agents.register({ id: session.id, session, status: 'idle', ctx } as Agent)
++    session.append('turn/start', { turn: 1 })
++    const chunk1 = session.append('assistant/chunk', {
++      turn: 1, step: 1,
++      chunk: { type: 'text-delta', index: 0, text: 'a' },
++    })
++    const chunk2 = session.append('assistant/chunk', {
++      turn: 1, step: 1,
++      chunk: { type: 'text-delta', index: 0, text: 'b' },
++    })
++    // No `stream` on the stored event: this is the pre-optimization log shape.
++    const assistant = session.append('assistant/message', {
++      turn: 1, step: 1,
++      message: createMessage({
++        role: 'assistant',
++        content: [{ type: 'text', text: 'ab' }],
++        source: { kind: 'model', provider: 'p', model: 'm' },
++      }),
++    }, { surfaceOp: 'append', sourceEventSeqs: [chunk1.seq, chunk2.seq] })
++
++    const response = await api.sessions.history({ rpcId: RpcId('t-hist-legacy'), payload: { sessionId: session.id } })
++    expect(response.result.ok).toBe(true)
++    if (!response.result.ok) throw new Error('unreachable')
++    const events = response.result.value.events.map(entry => entry.event)
++    expect(events.some(event => event.type === 'assistant/chunk')).toBe(false)
++    const wireAssistant = events.find(event => event.seq === assistant.seq)
++    expect(wireAssistant?.type).toBe('assistant/message')
++    if (wireAssistant?.type !== 'assistant/message') throw new Error('unreachable')
++    expect(wireAssistant.data.stream).toEqual({
++      firstChunkSeq: chunk1.seq,
++      firstChunkTime: chunk1.time,
++      firstTokenTime: chunk1.time,
++      chunkCount: 2,
++    })
++  })
++
+   it('counts only append-origin messages toward maxMessages and keeps each compaction summary with its replacement', async () => {
+     const { ctx } = await harness()
+     const api = createApiProxy(ctx, { defaultModelSelection: () => ({ provider: 'p', model: 'm' }), cwd: '/tmp' })
+diff --git a/packages/llm/llm-retry/tests/retry.spec.ts b/packages/llm/llm-retry/tests/retry.spec.ts
+index c2643a6d45..f51c264446 100644
+--- a/packages/llm/llm-retry/tests/retry.spec.ts
++++ b/packages/llm/llm-retry/tests/retry.spec.ts
+@@ -11,7 +11,7 @@ import type {
+   RetryPolicyConfig,
+   StreamChunk,
+ } from '@deepseek-ai/dsh-llm'
+-import SessionStore, { SessionId } from '@deepseek-ai/dsh-session'
++import SessionStore, { SessionId, sourceSeqIncludes } from '@deepseek-ai/dsh-session'
+ import type { SessionEvent, SessionEventMap } from '@deepseek-ai/dsh-session'
+ import type { LlmRetryEventData } from '@deepseek-ai/dsh-llm-retry/types'
+ import SystemPrompt from '@deepseek-ai/dsh-system-prompt'
+@@ -297,7 +297,7 @@ describe('provider-routed retry policy', () => {
+       step: event.data.step,
+     }))).toEqual([{ turn: 1, step: 1 }])
+     expect(failedChunks.every(event =>
+-      !assistantMessages[0]?.sourceEventSeqs?.includes(event.seq),
++      !sourceSeqIncludes(assistantMessages[0]?.sourceEventSeqs, event.seq),
+     )).toBe(true)
+     expect(agent.session.events.some(event => event.type === 'tool/call')).toBe(false)
+     expect(toolExecutions).toBe(0)
+diff --git a/packages/llm/token-meter/src/index.ts b/packages/llm/token-meter/src/index.ts
+index 2fa53f78f1..21824aac21 100644
+--- a/packages/llm/token-meter/src/index.ts
++++ b/packages/llm/token-meter/src/index.ts
+@@ -9,7 +9,7 @@ import z from '@deepseek-ai/schemastery'
+ import { BlockAssembler, deepFreeze } from '@deepseek-ai/dsh-llm'
+ import type { Message, TokenUsage } from '@deepseek-ai/dsh-llm'
+ import type { EpochHeader, Session, SessionEvent } from '@deepseek-ai/dsh-session'
+-import { canonicalHeader, headerEquals, isSurfaceEvent } from '@deepseek-ai/dsh-session'
++import { canonicalHeader, headerEquals, isSurfaceEvent, sourceSeqExpand } from '@deepseek-ai/dsh-session'
+ // Type-only: resolves the optional projection registry Context declaration.
+ import type {} from '@deepseek-ai/dsh-session-projection'
+ import type {
+@@ -284,7 +284,7 @@ export class TokenMeter extends Service {
+ 
+     const assembler = new BlockAssembler()
+     const seen = new Set<number>()
+-    for (const seq of sourceSeqs) {
++    for (const seq of sourceSeqExpand(sourceSeqs)) {
+       if (seq >= event.seq) {
+         throw new Error(`token meter: assistant/message at seq ${event.seq} source seq ${seq} is not earlier`)
+       }
+diff --git a/packages/session-query/session-query/src/tracing.ts b/packages/session-query/session-query/src/tracing.ts
+index 681e6ce59a..e24aca51cf 100644
+--- a/packages/session-query/session-query/src/tracing.ts
++++ b/packages/session-query/session-query/src/tracing.ts
+@@ -1,6 +1,6 @@
+ /** One-shot session-lineage and event-relationship tracing helpers. */
+ 
+-import { foldSurface, isSurfaceEvent, snapshotSessionEvent } from '@deepseek-ai/dsh-session'
++import { foldSurface, isSurfaceEvent, snapshotSessionEvent, sourceSeqExpand } from '@deepseek-ai/dsh-session'
+ import type { SessionEvent, SessionId, SurfaceEvent, SurfaceEventType } from '@deepseek-ai/dsh-session'
+ import { SessionQueryError } from './config.ts'
+ import type {
+@@ -214,7 +214,8 @@ function analyzeEventLog(
+ }
+ 
+ function eventSources(event: SessionEvent): readonly number[] {
+-  return (event as SessionEvent<SurfaceEventType>).sourceEventSeqs ?? []
++  const sources = (event as SessionEvent<SurfaceEventType>).sourceEventSeqs
++  return sources === undefined ? [] : sourceSeqExpand(sources)
+ }
+ 
+ function buildDescendants(
+diff --git a/packages/session/session-persistence-sqlite/src/schema.ts b/packages/session/session-persistence-sqlite/src/schema.ts
+index c7402d7d4b..ef9a46fb7c 100644
+--- a/packages/session/session-persistence-sqlite/src/schema.ts
++++ b/packages/session/session-persistence-sqlite/src/schema.ts
+@@ -10,7 +10,7 @@
+ 
+ import { randomUUID } from 'node:crypto'
+ import { DatabaseSync } from 'node:sqlite'
+-import type { SessionEvent, SessionId, SessionHeader, SurfaceOp } from '@deepseek-ai/dsh-session'
++import type { SessionEvent, SessionId, SessionHeader, SourceEventSeqs, SurfaceOp } from '@deepseek-ai/dsh-session'
+ 
+ /**
+  * The on-disk schema version. Bumped only on a breaking change to the table
+@@ -51,7 +51,7 @@ export interface EventRow {
+   type: string
+   time: number
+   data: string
+-  /** JSON-encoded `number[]` — the event's sourceEventSeqs, or null. */
++  /** JSON-encoded `SourceEventSeqs` (`number[]` or `{start,end}`), or null. */
+   source_event_seqs: string | null
+   /** JSON-encoded `SurfaceOp` — how the event entered the surface, or null. */
+   surface_op: string | null
+@@ -203,7 +203,7 @@ export function rowToEvent(row: EventRow): SessionEvent {
+   // Surface-metadata fields are conditional on the event type in the type
+   // system; spread them so each variant gets only the fields it declares.
+   const surfaceFields = {
+-    ...row.source_event_seqs !== null ? { sourceEventSeqs: JSON.parse(row.source_event_seqs) as number[] } : {},
++    ...row.source_event_seqs !== null ? { sourceEventSeqs: JSON.parse(row.source_event_seqs) as SourceEventSeqs } : {},
+     ...row.surface_op !== null ? { surfaceOp: JSON.parse(row.surface_op) as SurfaceOp } : {},
+   }
+   const ignorableField = row.ignorable === 1 ? { ignorable: true as const } : {}
