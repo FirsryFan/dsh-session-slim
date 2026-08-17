@@ -61,3 +61,7 @@ pnpm dsh web
 ## License
 
 BSD-3-Clause
+
+## 发布
+
+仓库已按可发布结构准备好；推送和 Release 步骤见 [docs/PUBLISH.md](docs/PUBLISH.md)。
